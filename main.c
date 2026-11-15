@@ -1,16 +1,7 @@
 /*
- * Connected Detector
- *
- * - Mendeteksi USB yang dicolok / dicabut selama program berjalan.
- * - Setiap device dicatat: nama vendor, nama produk, VID, PID, dan
- *   physical name (jalur bus-port, contoh "1-2.3").
- * - Saat program dihentikan (Ctrl+C), semua catatan disimpan ke file.
- * - Saat program dijalankan lagi, file dibaca. Device yang sama (VID+PID)
- *   langsung dikenali, tidak lagi tampil sebagai "Unknown device".
- *
- * Build : gcc main.c -o connected_detector $(pkg-config --cflags --libs libusb-1.0)
- * Run   : ./connected_detector [file_database]
- *         (default file: known_devices.txt)
+ * Connected Detector (libusb)
+ * Build: gcc main.c -o connected_detector $(pkg-config --cflags --libs libusb-1.0)
+ * Run:   ./connected_detector [database_file]
  */
 
 #include <libusb.h>
@@ -29,16 +20,14 @@ typedef struct {
     uint16_t pid;
     char vendor[STR_LEN];
     char product[STR_LEN];
-    char physical[PHYS_LEN];   /* port terakhir tempat device terlihat */
-    int  seen_now;             /* 1 jika muncul pada sesi ini */
+    char physical[PHYS_LEN];   /* last port the device was seen on */
+    int  seen_now;             /* seen during this session */
 } DeviceRecord;
 
 static DeviceRecord db[MAX_DEVICES];
 static int db_count = 0;
 static const char *db_path = DB_FILE_DEFAULT;
 static volatile sig_atomic_t running = 1;
-
-/* ---------- util ---------- */
 
 static void sanitize(char *s)
 {
@@ -62,9 +51,7 @@ static DeviceRecord *find_record(uint16_t vid, uint16_t pid)
     return NULL;
 }
 
-/* ---------- database file ---------- */
-
-/* Format per baris: VID<TAB>PID<TAB>vendor<TAB>product<TAB>physical */
+/* Line format: VID<TAB>PID<TAB>vendor<TAB>product<TAB>physical */
 static void load_db(void)
 {
     FILE *f = fopen(db_path, "r");
@@ -121,9 +108,7 @@ static int save_db(void)
     return 0;
 }
 
-/* ---------- membaca info device ---------- */
-
-/* Physical name = jalur bus-port, mis. "1-2.3" (sama dengan nama di /sys/bus/usb/devices) */
+/* Physical name = bus-port path, e.g. "1-2.3" */
 static void get_physical(libusb_device *dev, char *out, size_t size)
 {
     uint8_t ports[8];
@@ -139,7 +124,7 @@ static void get_physical(libusb_device *dev, char *out, size_t size)
         len += snprintf(out + len, size - len, ".%d", ports[i]);
 }
 
-/* Cara 1: baca string descriptor lewat libusb (butuh izin akses device) */
+/* Read string descriptors via libusb (needs device access) */
 static int read_names_libusb(libusb_device *dev, const struct libusb_device_descriptor *desc,
                              char *vendor, char *product)
 {
@@ -164,7 +149,7 @@ static int read_names_libusb(libusb_device *dev, const struct libusb_device_desc
     return got;
 }
 
-/* Cara 2 (Linux): baca dari sysfs, tidak butuh root */
+/* Linux fallback: read from sysfs (no root needed) */
 static int read_sysfs_file(const char *physical, const char *name, char *out)
 {
     char path[160];
@@ -188,8 +173,6 @@ static int read_names_sysfs(const char *physical, char *vendor, char *product)
     return a || b;
 }
 
-/* ---------- tampilan ---------- */
-
 static void print_device_line(const char *tag, const char *vendor, const char *product,
                               uint16_t vid, uint16_t pid, const char *physical, const char *note)
 {
@@ -204,8 +187,6 @@ static void print_device_line(const char *tag, const char *vendor, const char *p
                vid, pid, physical, note);
     }
 }
-
-/* ---------- hotplug ---------- */
 
 static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
                                         libusb_hotplug_event event, void *user_data)
@@ -225,7 +206,6 @@ static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
         char vendor[STR_LEN]  = "";
         char product[STR_LEN] = "";
 
-        /* Coba baca nama langsung dari device */
         int live = read_names_libusb(dev, &desc, vendor, product);
         if (!live)
             live = read_names_sysfs(physical, vendor, product);
@@ -247,13 +227,12 @@ static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
                     rec->seen_now = 1;
                     print_device_line("[PLUGGED] ", vendor, product, desc.idVendor,
                                       desc.idProduct, physical, "  (device baru, disimpan)");
-                    save_db(); /* simpan segera agar tidak hilang jika program mati mendadak */
+                    save_db();
                 } else {
                     print_device_line("[PLUGGED] ", vendor, product, desc.idVendor,
                                       desc.idProduct, physical, "");
                 }
             } else {
-                /* Sudah dikenal: perbarui nama bila ada yang lebih lengkap */
                 if (vendor[0])  copy_str(rec->vendor,  sizeof rec->vendor,  vendor);
                 if (product[0]) copy_str(rec->product, sizeof rec->product, product);
                 copy_str(rec->physical, sizeof rec->physical, physical);
@@ -262,7 +241,7 @@ static int LIBUSB_CALL hotplug_callback(libusb_context *ctx, libusb_device *dev,
                                   desc.idProduct, physical, "  (dikenal)");
             }
         } else if (rec) {
-            /* Nama tidak bisa dibaca, tapi ada di database -> pakai catatan lama */
+            /* name unreadable: fall back to the database */
             copy_str(rec->physical, sizeof rec->physical, physical);
             rec->seen_now = 1;
             print_device_line("[PLUGGED] ", rec->vendor, rec->product, desc.idVendor,
@@ -285,8 +264,6 @@ static void on_signal(int sig)
     (void)sig;
     running = 0;
 }
-
-/* ---------- main ---------- */
 
 int main(int argc, char **argv)
 {
@@ -333,7 +310,6 @@ int main(int argc, char **argv)
 
     libusb_hotplug_deregister_callback(ctx, handle);
 
-    /* Ringkasan sesi */
     printf("\n=== Device yang terdeteksi pada sesi ini ===\n");
     int shown = 0;
     for (int i = 0; i < db_count; i++) {
